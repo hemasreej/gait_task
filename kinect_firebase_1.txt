@@ -1,0 +1,161 @@
+Imports System
+Imports System.Collections.Generic
+Imports Microsoft.Kinect
+Imports FirebaseAdmin
+Imports Google.Apis.Auth.OAuth2
+Imports Firebase.Database
+Imports Firebase.Database.Query
+
+Module Module1
+    Dim sensor As KinectSensor
+    Dim trackedSkeletons As New Dictionary(Of Integer, Double)()
+    Dim heightOutputted As Boolean = False ' Flag to ensure height is outputted only once
+    Dim firebaseClient As FirebaseClient ' Declare firebaseClient at module level
+
+    Sub Main()
+        ' Initialize Firebase
+        Dim credential = GoogleCredential.FromFile("C:\Users\hemas\source\repos\KinectheightMeasurement\KinectheightMeasurement\gait-revive-dddf8-firebase-adminsdk-dgfrx-f1be75a8c7.json")
+
+        ' Initialize FirebaseApp with Firebase options
+        Dim app = FirebaseApp.Create(New AppOptions With {
+            .Credential = credential
+        })
+
+        ' Initialize Firebase client to interact with Realtime Database
+        Dim databaseUrl As String = "https://gait-revive-dddf8-default-rtdb.firebaseio.com/" ' Replace with your Firebase database URL
+        firebaseClient = New FirebaseClient(databaseUrl)
+
+        ' Initialize Kinect sensor
+        Try
+            sensor = KinectSensor.KinectSensors.FirstOrDefault(Function(s) s.Status = KinectStatus.Connected)
+            If sensor Is Nothing Then
+                Console.WriteLine("No Kinect sensor detected.")
+                Return
+            End If
+
+            sensor.SkeletonStream.Enable()
+            sensor.Start()
+
+            Console.WriteLine("Kinect sensor started successfully.")
+
+            ' Event to handle skeleton frame ready
+            AddHandler sensor.SkeletonFrameReady, AddressOf Sensor_SkeletonFrameReady
+
+            ' Keep the console window open
+            Console.WriteLine("Press any key to exit...")
+            Console.ReadKey()
+
+            ' Stop the sensor when done
+            sensor.Stop()
+        Catch ex As Exception
+            Console.WriteLine("Error initializing Kinect sensor: " & ex.Message)
+        End Try
+    End Sub
+
+    Sub Sensor_SkeletonFrameReady(sender As Object, e As SkeletonFrameReadyEventArgs)
+        If heightOutputted Then
+            ' If height has already been outputted, do nothing
+            Return
+        End If
+
+        Try
+            Using skeletonFrame As SkeletonFrame = e.OpenSkeletonFrame()
+                If skeletonFrame IsNot Nothing Then
+                    Dim skeletons(skeletonFrame.SkeletonArrayLength - 1) As Skeleton
+                    skeletonFrame.CopySkeletonDataTo(skeletons)
+
+                    Console.WriteLine("Skeleton frame received. Processing skeletons...")
+
+                    For Each skeleton As Skeleton In skeletons
+                        If skeleton.TrackingState = SkeletonTrackingState.Tracked Then
+                            Dim skeletonID As Integer = skeleton.TrackingId
+                            Dim height As Double = CalculateHeight(skeleton)
+
+                            ' Output the height only once
+                            If Not heightOutputted Then
+                                trackedSkeletons(skeletonID) = height
+                                Console.WriteLine("Estimated Height for Skeleton ID " & skeletonID & ": " & trackedSkeletons(skeletonID) & " meters")
+
+                                ' Save the height to Firebase
+                                SaveHeightToFirebase(height)
+
+                                heightOutputted = True
+                            End If
+
+                            ' Break out of the loop after processing the first tracked skeleton
+                            Exit For
+                        End If
+                    Next
+                Else
+                    Console.WriteLine("No skeleton frame available.")
+                End If
+            End Using
+        Catch ex As Exception
+            Console.WriteLine("Error processing skeleton frame: " & ex.Message)
+        End Try
+    End Sub
+
+    Sub SaveHeightToFirebase(height As Double)
+        Try
+            ' Reference to your Firebase database (single key "latestHeight" to store the latest height)
+            Dim reference = firebaseClient.Child("latestHeight")
+
+            ' Save height asynchronously
+            Dim task = reference.PutAsync(height)
+            task.Wait() ' Wait for completion (for simplicity, in production code, handle asynchronously)
+
+            Console.WriteLine("Height saved to Firebase: " & height & " meters")
+        Catch ex As Exception
+            Console.WriteLine("Error saving height to Firebase: " & ex.Message)
+        End Try
+    End Sub
+
+    Function CalculateHeight(skeleton As Skeleton) As Double
+        If skeleton Is Nothing Then
+            Return 0.0
+        End If
+
+        ' Calculate the distance between two joints
+        Dim head As Joint = skeleton.Joints(JointType.Head)
+        Dim shoulderCenter As Joint = skeleton.Joints(JointType.ShoulderCenter)
+        Dim spine As Joint = skeleton.Joints(JointType.Spine)
+        Dim hipCenter As Joint = skeleton.Joints(JointType.HipCenter)
+        Dim hipLeft As Joint = skeleton.Joints(JointType.HipLeft)
+        Dim hipRight As Joint = skeleton.Joints(JointType.HipRight)
+        Dim kneeLeft As Joint = skeleton.Joints(JointType.KneeLeft)
+        Dim kneeRight As Joint = skeleton.Joints(JointType.KneeRight)
+        Dim ankleLeft As Joint = skeleton.Joints(JointType.AnkleLeft)
+        Dim ankleRight As Joint = skeleton.Joints(JointType.AnkleRight)
+        Dim footLeft As Joint = skeleton.Joints(JointType.FootLeft)
+        Dim footRight As Joint = skeleton.Joints(JointType.FootRight)
+
+        ' Function to calculate distance between two joints
+        Dim distance As Func(Of Joint, Joint, Double) = Function(joint1, joint2) Math.Sqrt(Math.Pow(joint1.Position.X - joint2.Position.X, 2) +
+                                                                                           Math.Pow(joint1.Position.Y - joint2.Position.Y, 2) +
+                                                                                           Math.Pow(joint1.Position.Z - joint2.Position.Z, 2))
+
+        ' Calculate torso height
+        Dim torsoHeight As Double = distance(head, shoulderCenter) +
+                                    distance(shoulderCenter, spine) +
+                                    distance(spine, hipCenter) +
+                                    distance(hipCenter, New Joint With {.Position = New SkeletonPoint With {
+                                        .X = (hipLeft.Position.X + hipRight.Position.X) / 2,
+                                        .Y = (hipLeft.Position.Y + hipRight.Position.Y) / 2,
+                                        .Z = (hipLeft.Position.Z + hipRight.Position.Z) / 2
+                                    }})
+
+        ' Calculate leg heights
+        Dim leftLegHeight As Double = distance(hipLeft, kneeLeft) +
+                                      distance(kneeLeft, ankleLeft) +
+                                      distance(ankleLeft, footLeft)
+
+        Dim rightLegHeight As Double = distance(hipRight, kneeRight) +
+                                       distance(kneeRight, ankleRight) +
+                                       distance(ankleRight, footRight)
+
+        ' Calculate total height
+        Dim totalHeight As Double = torsoHeight + (leftLegHeight + rightLegHeight) / 2.0
+
+        Return totalHeight
+    End Function
+End Module
